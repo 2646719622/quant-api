@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 QuantMonitor API - 真实A股数据版
-数据源：腾讯财经免费API（无需key，国内直连）
+返回格式完全匹配 Android APP Kotlin 数据模型
 """
 
 from fastapi import FastAPI
@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 import random
 import time
 
-app = FastAPI(title="QuantMonitor API - 真实数据")
+app = FastAPI(title="QuantMonitor API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,11 +21,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ============================================================
-# 腾讯财经免费API - 真实A股行情
-# ============================================================
-
-# 监控股票池（一夜持股 / 短线 / 长线）
+# ===== 监控股票池 =====
 SECTIONS_STOCKS = {
     "overnight": [
         ("sh000001", "上证指数"),
@@ -59,10 +55,8 @@ SECTIONS_STOCKS = {
     ],
 }
 
-# 信号类型
 SIGNAL_TYPES = ["买入", "加仓", "减仓", "卖出", "观望"]
 
-# 信号原因模板
 REASONS = {
     "买入": ["MACD金叉，量能配合", "突破前期高点，成交量放大", "布林带下轨支撑，RSI超卖反弹"],
     "加仓": ["均线多头排列，趋势向上", "回调至10日均线获支撑", "量价配合，主力资金流入"],
@@ -71,7 +65,7 @@ REASONS = {
     "观望": ["横盘震荡，方向不明", "等待财报指引", "量能不足，暂观望"],
 }
 
-ACTION_PLANS = {
+ACTIONS = {
     "买入": "建议明日开盘30分钟内逢低买入，仓位控制在20%以内，止损设-5%",
     "加仓": "可适量加仓，建议不超过当前持仓的30%，设好移动止损",
     "减仓": "建议分批减仓，先减30%锁定收益，剩余仓位设好止盈",
@@ -80,19 +74,11 @@ ACTION_PLANS = {
 }
 
 
-def fetch_realtime_quotes(stock_codes: List[str]) -> Dict[str, Dict]:
-    """
-    调用腾讯财经免费API获取实时行情
-    返回格式: {code: {name, price, change_pct, open, high, low, prev_close}}
-    """
+def fetch_quotes(stock_codes: List[str]) -> Dict[str, Dict]:
+    """调用腾讯财经API获取实时行情"""
     import urllib.request
-    import json
-
-    # 构造请求
-    # 腾讯API格式: qt.gtimg.cn/q=sh600519,sz000001
     codes_str = ",".join(stock_codes)
     url = f"https://qt.gtimg.cn/q={codes_str}"
-
     result = {}
     try:
         req = urllib.request.Request(url, headers={
@@ -101,72 +87,43 @@ def fetch_realtime_quotes(stock_codes: List[str]) -> Dict[str, Dict]:
         })
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = resp.read().decode("gbk", errors="replace")
-
-        # 解析返回数据
-        # 格式: v_sh600519="1~贵州茅台~600519~1285.88~1290.20~..."
         for line in data.strip().split("\n"):
             if not line.strip():
                 continue
             try:
-                # 提取变量名和数据
                 eq_pos = line.find("=")
                 if eq_pos == -1:
                     continue
-                var_name = line[:eq_pos].strip()
                 data_str = line[eq_pos+1:].strip().strip('"')
-
                 if not data_str:
                     continue
-
                 parts = data_str.split("~")
                 if len(parts) < 50:
                     continue
-
-                # parts[0]=类型, [1]=名字, [2]=代码, [3]=现价, [4]=昨收
-                # [5]=今开, [6]=成交量, [7]=外盘, [8]=内盘
-                # [9]=买一, [10]=买一量, [11]=买二, ...
-                # [14]=卖一, [15]=卖一量, ...
-                # [30]=最高, [31]=最低, [32]=日期, [33]=时间
-
                 code_raw = parts[2]
                 name = parts[1]
                 price = float(parts[3]) if parts[3] else 0.0
                 prev_close = float(parts[4]) if parts[4] else 0.0
-                open_price = float(parts[5]) if parts[5] else 0.0
-                high = float(parts[30]) if len(parts) > 30 and parts[30] else 0.0
-                low = float(parts[31]) if len(parts) > 31 and parts[31] else 0.0
-
-                change_pct = 0.0
-                if prev_close > 0:
-                    change_pct = round((price - prev_close) / prev_close * 100, 2)
-
+                change_pct = round((price - prev_close) / prev_close * 100, 2) if prev_close > 0 else 0.0
                 result[code_raw] = {
                     "name": name,
                     "price": price,
-                    "prev_close": prev_close,
-                    "open": open_price,
-                    "high": high,
-                    "low": low,
                     "change_pct": change_pct,
-                    "time": parts[33] if len(parts) > 33 else "",
+                    "time": parts[33] if len(parts) > 33 else datetime.now().strftime("%H:%M"),
                 }
-            except Exception as e:
-                print(f"解析行失败: {line[:50]}... err={e}")
+            except Exception:
                 continue
-
     except Exception as e:
         print(f"获取行情失败: {e}")
-
     return result
 
 
-def generate_signals_for_stock(code: str, name: str, section: str, quote: dict) -> dict:
-    """根据实时行情生成量化信号"""
+def make_signal(code: str, name: str, section: str, quote: dict, is_history: bool = False) -> dict:
+    """生成信号，字段名完全匹配APP Kotlin模型"""
     price = quote.get("price", 0)
     change_pct = quote.get("change_pct", 0)
-    prev_close = quote.get("prev_close", price)
+    now = datetime.now()
 
-    # 根据涨跌幅和价格位置判断信号
     if change_pct > 2.5:
         signal_type = random.choice(["买入", "加仓"] if change_pct > 4 else ["加仓", "观望"])
     elif change_pct < -2.5:
@@ -174,7 +131,6 @@ def generate_signals_for_stock(code: str, name: str, section: str, quote: dict) 
     else:
         signal_type = random.choice(["观望", "买入", "加仓"])
 
-    # 计算置信度
     abs_change = abs(change_pct)
     if abs_change > 5:
         confidence = random.randint(82, 95)
@@ -183,122 +139,93 @@ def generate_signals_for_stock(code: str, name: str, section: str, quote: dict) 
     else:
         confidence = random.randint(55, 75)
 
-    reason = random.choice(REASONS.get(signal_type, ["技术指标综合信号"]))
-    action = ACTION_PLANS.get(signal_type, "请结合个人风险偏好操作")
+    if is_history:
+        days_ago = random.randint(0, 30)
+        hours_ago = random.randint(0, 23)
+        ts = (now - timedelta(days=days_ago, hours=hours_ago)).strftime("%m-%d %H:%M")
+    else:
+        ts = quote.get("time", now.strftime("%H:%M"))
 
-    # 模拟技术指标
-    import random as rnd
-    rnd.seed(int(code[-3:]) + int(time.time() // 300))  # 5分钟变一次
-    macd = round(rnd.uniform(-2, 2), 2)
-    rsi = round(50 + change_pct * 3 + rnd.uniform(-10, 10), 1)
+    # 指标
+    random.seed(int(code[-3:]) + int(time.time() // 300))
+    macd = round(random.uniform(-2, 2), 2)
+    rsi = round(50 + change_pct * 3 + random.uniform(-10, 10), 1)
     rsi = max(5, min(95, rsi))
-    kdj_k = round(50 + change_pct * 2 + rnd.uniform(-15, 15), 1)
-    kdj_d = round(kdj_k + rnd.uniform(-5, 5), 1)
+    kdj_k = round(50 + change_pct * 2 + random.uniform(-15, 15), 1)
 
     return {
-        "stock_code": code[-6:] if len(code) > 6 else code,
-        "stock_name": name,
+        "code": code[-6:] if len(code) > 6 else code,
+        "name": name,
         "section": section,
-        "signal_type": signal_type,
-        "confidence": confidence,
-        "price": price,
-        "change_pct": change_pct,
-        "reason": reason,
-        "timestamp": quote.get("time", datetime.now().strftime("%H:%M")),
+        "signalType": signal_type,
+        "confidence": float(confidence),
+        "price": round(price, 2),
+        "changePct": round(change_pct, 2),
+        "reason": random.choice(REASONS.get(signal_type, ["技术指标综合信号"])),
+        "timestamp": ts,
         "indicators": {
             "MACD": macd,
             "RSI": rsi,
             "KDJ_K": kdj_k,
-            "KDJ_D": kdj_d,
         },
-        "action_plan": action,
+        "actionPlan": ACTIONS.get(signal_type, "请结合个人风险偏好操作"),
     }
 
 
 # ============================================================
-# API 路由
+# API 路由 - 返回格式匹配 APP Kotlin Models
 # ============================================================
 
 @app.get("/api/sections")
 def get_sections():
+    """返回 Map<String, Any> 格式，直接匹配 APP"""
     return {
-        "success": True,
-        "data": {
-            "一夜持股": {
-                "id": "overnight",
-                "name": "一夜持股",
-                "description": "当日买入，次日卖出",
-                "color": "#FF6B6B",
-            },
-            "短线": {
-                "id": "short",
-                "name": "短线",
-                "description": "1-5日短线交易",
-                "color": "#4ECDC4",
-            },
-            "长线": {
-                "id": "long",
-                "name": "长线",
-                "description": "中长期价值投资",
-                "color": "#45B7D1",
-            },
-        },
-        "timestamp": datetime.now().isoformat(),
+        "一夜持股": {"id": "overnight", "name": "一夜持股", "description": "当日买入，次日卖出", "color": "#FF6B6B"},
+        "短线": {"id": "short", "name": "短线", "description": "1-5日短线交易", "color": "#4ECDC4"},
+        "长线": {"id": "long", "name": "长线", "description": "中长期价值投资", "color": "#45B7D1"},
     }
 
 
 @app.get("/api/current_signals")
 def get_current_signals():
-    """获取当前各类信号（真实行情 + 量化信号）"""
-    import random as rnd
-    rnd.seed(int(time.time() // 60))  # 每分钟信号刷新
+    """返回 ApiResponse 格式: {timestamp, sections: {sectionId: MonitorResult}}"""
+    now = datetime.now()
+    now_str = now.isoformat()
 
-    signals = {}
-    now_str = datetime.now().strftime("%H:%M")
-
+    sections = {}
     for section_name, section_id in [("一夜持股", "overnight"), ("短线", "short"), ("长线", "long")]:
         stock_list = SECTIONS_STOCKS.get(section_id, [])
         codes = [code for code, _ in stock_list]
-        quotes = fetch_realtime_quotes(codes)
+        quotes = fetch_quotes(codes)
 
-        count = min(rnd.randint(3, 6), len(stock_list))
-        selected = rnd.sample(stock_list, count) if len(stock_list) >= count else stock_list
+        count = min(random.randint(3, 6), len(stock_list))
+        selected = random.sample(stock_list, count) if len(stock_list) >= count else stock_list
 
-        section_signals = []
+        signals = []
         for code, name in selected:
             quote = quotes.get(code, {})
             if not quote:
-                # 如果获取失败，用模拟数据
-                quote = {
-                    "price": 100.0 + rnd.uniform(-20, 20),
-                    "change_pct": rnd.uniform(-5, 5),
-                    "time": now_str,
-                }
-            signal = generate_signals_for_stock(code, name, section_name, quote)
-            section_signals.append(signal)
+                quote = {"price": 100.0 + random.uniform(-20, 20), "change_pct": random.uniform(-5, 5), "time": now.strftime("%H:%M")}
+            signals.append(make_signal(code, name, section_name, quote))
 
-        signals[section_id] = {
-            "section_name": section_name,
-            "count": len(section_signals),
-            "signals": section_signals,
+        sections[section_id] = {
+            "section": section_name,
+            "timestamp": now_str,
+            "newSignals": signals,
+            "activeStocks": [],
+            "marketStatus": {},
         }
 
     return {
-        "success": True,
-        "data": signals,
-        "timestamp": datetime.now().isoformat(),
-        "data_source": "腾讯财经实时行情",
+        "timestamp": now_str,
+        "sections": sections,
     }
 
 
 @app.get("/api/signal_history")
 def get_signal_history(section: Optional[str] = None, limit: int = 20):
-    """获取历史信号记录"""
-    import random as rnd
-    rnd.seed(int(time.time() // 3600))  # 每小时刷新
-
+    """返回 List<StockSignal> 格式"""
     all_signals = []
-    now = datetime.now()
 
     target_sections = []
     for section_name, section_id in [("一夜持股", "overnight"), ("短线", "short"), ("长线", "long")]:
@@ -308,36 +235,23 @@ def get_signal_history(section: Optional[str] = None, limit: int = 20):
 
     for section_name, section_id in target_sections:
         stock_list = SECTIONS_STOCKS.get(section_id, [])
-        # 获取真实行情
         codes = [code for code, _ in stock_list]
-        quotes = fetch_realtime_quotes(codes)
+        quotes = fetch_quotes(codes)
 
         n = min(limit // len(target_sections) + 1, 8)
         for _ in range(n):
-            code, name = rnd.choice(stock_list)
+            code, name = random.choice(stock_list)
             quote = quotes.get(code, {})
             if not quote:
-                quote = {
-                    "price": 100.0 + rnd.uniform(-30, 30),
-                    "change_pct": rnd.uniform(-6, 6),
-                }
+                quote = {"price": 100.0 + random.uniform(-30, 30), "change_pct": random.uniform(-6, 6)}
+            all_signals.append(make_signal(code, name, section_name, quote, is_history=True))
 
-            days_ago = rnd.randint(0, 30)
-            hours_ago = rnd.randint(0, 23)
-            signal_time = (now - timedelta(days=days_ago, hours=hours_ago)).strftime("%m-%d %H:%M")
-
-            signal = generate_signals_for_stock(code, name, section_name, quote)
-            signal["signal_time"] = signal_time
-            all_signals.append(signal)
-
-    all_signals.sort(key=lambda x: x["signal_time"], reverse=True)
+    all_signals.sort(key=lambda x: x["timestamp"], reverse=True)
     return all_signals[:limit]
 
 
 @app.get("/api/quote/{stock_code}")
 def get_quote(stock_code: str):
-    """获取单只股票实时行情"""
-    # 自动补充前缀
     if stock_code.startswith("6"):
         full_code = f"sh{stock_code}"
     elif stock_code[0] in "0123":
@@ -345,16 +259,15 @@ def get_quote(stock_code: str):
     else:
         full_code = stock_code
 
-    quotes = fetch_realtime_quotes([full_code])
+    quotes = fetch_quotes([full_code])
     if full_code in quotes:
-        return {"success": True, "data": quotes[full_code]}
-    else:
-        return {"success": False, "message": "获取行情失败"}
+        return quotes[full_code]
+    return {"error": "获取行情失败"}
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "2.0", "data_source": "腾讯财经API"}
+    return {"status": "ok", "version": "3.0", "data_source": "腾讯财经API"}
 
 
 if __name__ == "__main__":
